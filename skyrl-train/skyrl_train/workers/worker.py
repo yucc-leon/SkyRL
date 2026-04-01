@@ -81,7 +81,7 @@ class DistributedTorchRayActor:
         if not torch.distributed.is_initialized():
             # Default torch dist pg init timeout is 10 minutes (600 seconds)
             torch.distributed.init_process_group(
-                backend="nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+                backend="hccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
             )
 
         # setup device mesh
@@ -414,7 +414,7 @@ class PPORayActorGroup:
                 reordered_bundle_indices = get_reordered_bundle_indices(pg)
 
         if self._num_gpus_per_node > 1 and pg is None:
-            bundles = [{"GPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node} for _ in range(self._num_nodes)]
+            bundles = [{"NPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node} for _ in range(self._num_nodes)]
             if self._resources:
                 resources_name = list(self._resources.keys())[0]
                 for i in range(len(bundles)):

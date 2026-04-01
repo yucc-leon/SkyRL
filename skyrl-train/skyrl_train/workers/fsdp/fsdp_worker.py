@@ -30,7 +30,7 @@ from skyrl_train.workers.worker import (
 
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
+        self._set_numa_affinity(torch.distributed.get_rank() % torch.npu.device_count())
         self.strategy.offload_to_cpu(
             self.model, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
         )
@@ -142,7 +142,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             # clear prefix cache
             cache_reset_task = inference_engine_client.reset_prefix_cache()
 
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
         if fsdp_version(self.model.model) == 1:
             FSDP.set_state_dict_type(
                 self.model.model,
@@ -182,7 +182,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 # broadcast
                 def gather_and_broadcast(param):
                     # For FSDP, gather parameter and broadcast to all InferenceEngines by rank 0
-                    device = torch.cuda.current_device()
+                    device = torch.npu.current_device()
                     param = param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
                     # cast to generator dtype
                     param = param.to(generator_dtype)
@@ -219,7 +219,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
                     from torch.multiprocessing.reductions import reduce_tensor
 
-                    device = torch.cuda.current_device()
+                    device = torch.npu.current_device()
                     param = param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
                     param = param.to(generator_dtype)
                     weight = param.detach().contiguous()
@@ -269,7 +269,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         if cache_reset_task is not None:
             await cache_reset_task
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
         torch.distributed.barrier()
 
     def get_weight_statistics(self):
@@ -297,7 +297,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
 class FSDPCriticWorkerBase(CriticWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
+        self._set_numa_affinity(torch.distributed.get_rank() % torch.npu.device_count())
         self.strategy.offload_to_cpu(
             self.model, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
         )
@@ -374,7 +374,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
 
 class FSDPRefWorkerBase(RefWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, **kwargs):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
+        self._set_numa_affinity(torch.distributed.get_rank() % torch.npu.device_count())
         self.strategy.offload_to_cpu(self.model, None, pin_memory, non_blocking)
 
     def backload_to_gpu(self, non_blocking=True, **kwargs):

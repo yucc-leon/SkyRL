@@ -78,7 +78,7 @@ class WorkerWrap:
         rank_offset,
         world_size,
         group_name,
-        backend="nccl",
+        backend="hccl",
         override_existing: bool = False,
     ):
         """Init torch process group for model weights update"""
@@ -118,7 +118,7 @@ class WorkerWrap:
         for name, dtype, shape in zip(names, dtypes, shapes):
             dtype = str_to_torch_dtype(dtype)
             assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
-            weight = torch.empty(shape, dtype=dtype, device="cuda")
+            weight = torch.empty(shape, dtype=dtype, device="npu")
             torch.distributed.broadcast(weight, 0, group=self._model_update_group)
             weight_list.append((name, weight))
 
@@ -146,8 +146,8 @@ class WorkerWrap:
             assert len(sizes) == len(names), "sizes must be provided for packed weight update"
             assert all(isinstance(size, int) for size in sizes), "sizes should be a list of integers"
 
-            device = torch.cuda.current_device()
-            props = torch.cuda.get_device_properties(device)
+            device = torch.npu.current_device()
+            props = torch.npu.get_device_properties(device)
             physical_gpu_id = str(props.uuid)
 
             handle = ipc_handles[0][physical_gpu_id]
@@ -165,8 +165,8 @@ class WorkerWrap:
             for name, dtype, shape, ipc_handle in zip(names, dtypes, shapes, ipc_handles):
 
                 dtype = str_to_torch_dtype(dtype)
-                device = torch.cuda.current_device()
-                props = torch.cuda.get_device_properties(device)
+                device = torch.npu.current_device()
+                props = torch.npu.get_device_properties(device)
                 physical_gpu_id = str(props.uuid)
 
                 assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"

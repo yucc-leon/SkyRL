@@ -43,8 +43,8 @@ else:
 
 def init_fn(x: torch.nn.Module):
     if torch.distributed.get_rank() != 0:
-        x = x.to_empty(device=torch.cuda.current_device(), recurse=False)
-        torch.cuda.empty_cache()
+        x = x.to_empty(device=torch.npu.current_device(), recurse=False)
+        torch.npu.empty_cache()
     return x
 
 
@@ -156,14 +156,14 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
         flat_param._local_shard = flat_param.data
         assert id(flat_param._local_shard) != id(flat_param.data)
     if empty_cache:
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
 
 
 @torch.no_grad()
 def offload_fsdp2_model_to_cpu(model, empty_cache: bool = True):
     model.to("cpu", non_blocking=True)
     if empty_cache:
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
 
 
 @torch.no_grad()
@@ -176,19 +176,19 @@ def load_fsdp_model_to_gpu(model: FSDP):
     # lazy init FSDP model
     _lazy_init(model, model)
     assert model._is_root, "Only support root model loading to GPU"
-    device_id = torch.cuda.current_device()
+    device_id = torch.npu.current_device()
     for handle in model._all_handles:
         if handle._offload_params:
             continue
         flat_param = handle.flat_param
-        handle.flat_param_to(torch.device(f"cuda:{device_id}"), non_blocking=True)
+        handle.flat_param_to(torch.device(f"npu:{device_id}"), non_blocking=True)
         # the following still keeps id(._local_shard) != id(.data)
         flat_param._local_shard = flat_param.data
 
 
 @torch.no_grad()
 def load_fsdp2_model_to_gpu(model):
-    device = torch.cuda.current_device()
+    device = torch.npu.current_device()
     model.to(device, non_blocking=True)
 
 
@@ -280,7 +280,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
 
     if dist.get_rank() == 0:
         for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
-            full_param = full_param.detach().cuda()
+            full_param = full_param.detach().npu()
             mesh = sharded_param.device_mesh
             dist.broadcast(full_param, src=0)
             sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
@@ -294,7 +294,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
-            full_tensor = torch.empty(sharded_param.size(), device="cuda", dtype=sharded_param.dtype)
+            full_tensor = torch.empty(sharded_param.size(), device="npu", dtype=sharded_param.dtype)
             mesh = sharded_param.device_mesh
             dist.broadcast(full_tensor, src=0)
             sharded_tensor = distribute_tensor(full_tensor, mesh, sharded_param.placements)
@@ -310,14 +310,14 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     model.load_state_dict(sharded_sd, assign=True)
 
     # If we don't offload FSDP2 Module to CPU and then back to GPU,
-    # it will occupy a large amount of reserved GPU memory，which can not be released using torch.cuda.empty_cache()
+    # it will occupy a large amount of reserved GPU memory，which can not be released using torch.npu.empty_cache()
     # even if we are using cpu_offload
     # TODO (erictang000): this requires an additional offload + backload, see if this can be avoided
     # Credit: https://github.com/volcengine/verl/pull/1667
     offload_fsdp2_model_to_cpu(model)
 
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()
 
     if not cpu_offload:
         load_fsdp2_model_to_gpu(model)
@@ -398,10 +398,10 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
 
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
-        device_mesh = init_device_mesh("cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
+        device_mesh = init_device_mesh("npu", mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
     else:
         device_mesh = init_device_mesh(
-            "cuda", mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"]
+            "npu", mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"]
         )
     return device_mesh
 
@@ -525,7 +525,7 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
                     }
                     lora_params.update(sub_lora_params)
                     submodule._is_root = False
-                torch.cuda.empty_cache()
+                torch.npu.empty_cache()
     return lora_params
 
 
@@ -544,7 +544,7 @@ def collect_lora_params(module: FSDP) -> OrderedDict:
                 name: param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
                 for name, param in lora_params.items()
             }
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
     else:
         lora_params = get_peft_model_state_dict(peft_model)
     return lora_params

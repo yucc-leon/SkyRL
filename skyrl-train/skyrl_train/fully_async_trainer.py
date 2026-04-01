@@ -343,8 +343,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             self.init_weight_sync_state()
 
         # sync weights to inference engines
-        with Timer("sync_weights_to_inference_engines"):
-            await self.async_sync_policy_weights_to_inference_engines()
+        # NOTE: Temporarily disabled for NPU debugging - initial weight sync breaks vLLM engine
+        # with Timer("sync_weights_to_inference_engines"):
+        #     await self.async_sync_policy_weights_to_inference_engines()
+        import os
+        if os.environ.get("SKYRL_SKIP_WEIGHT_SYNC", "0") == "1":
+            logger.info("Skipping initial weight sync (SKYRL_SKIP_WEIGHT_SYNC=1)")
+        else:
+            with Timer("sync_weights_to_inference_engines"):
+                await self.async_sync_policy_weights_to_inference_engines()
 
         # Eval before training
         if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
@@ -407,10 +414,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         )
 
                     # 4. After training: pause generation, sync weights, resume.
-                    with Timer("sync_weights", self.all_timings):
-                        await self.inference_engine_client.pause_generation()
-                        await self.async_sync_policy_weights_to_inference_engines()
-                        await self.inference_engine_client.resume_generation()
+                    if os.environ.get("SKYRL_SKIP_WEIGHT_SYNC", "0") == "1":
+                        logger.info("Skipping weight sync (SKYRL_SKIP_WEIGHT_SYNC=1)")
+                    else:
+                        with Timer("sync_weights", self.all_timings):
+                            await self.inference_engine_client.pause_generation()
+                            await self.async_sync_policy_weights_to_inference_engines()
+                            await self.inference_engine_client.resume_generation()
 
                 # 5. Set logs for this training step.
                 logger.info(status)

@@ -568,6 +568,11 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
         env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
 
+    # Forward proxy settings to Ray workers (needed for wandb etc.)
+    for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "no_proxy", "NO_PROXY"):
+        if os.environ.get(proxy_var):
+            env_vars[proxy_var] = os.environ[proxy_var]
+
     return env_vars
 
 
