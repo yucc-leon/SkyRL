@@ -208,6 +208,20 @@ def _apply_patch():
     os.environ.setdefault("HCCL_CONNECT_TIMEOUT", "360")
     os.environ.setdefault("HCCL_EXEC_TIMEOUT", "360")
 
+    # --- 6. Patch torch.autocast so device_type="cuda" works on NPU ---
+    _orig_autocast = torch.autocast
+
+    class _PatchedAutocast(_orig_autocast):
+        def __init__(self, device_type, *args, **kwargs):
+            if device_type == "cuda":
+                device_type = "npu"
+            super().__init__(device_type, *args, **kwargs)
+
+    torch.autocast = _PatchedAutocast
+    # Also patch torch.amp.autocast (used by some code paths)
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        torch.amp.autocast = _PatchedAutocast
+
     logger.info("NPU patch applied: torch.cuda → torch.npu, DeviceMesh → npu, flash_attn stubbed, Ray GPU→NPU")
 
 
@@ -333,10 +347,32 @@ def _install_flash_attn_stub():
     bert_padding = _make_stub("flash_attn.bert_padding")
 
     def _pad_input(hidden_states, indices, batch, seqlen):
-        raise NotImplementedError("flash_attn.bert_padding.pad_input is not available on NPU")
+        """Pad a packed (nnz, ...) tensor back to (batch, seqlen, ...) layout.
+
+        Pure PyTorch implementation compatible with NPU — no CUDA kernels needed.
+        """
+        import torch as _t
+        other_dims = hidden_states.shape[1:]
+        output = _t.zeros(batch * seqlen, *other_dims, dtype=hidden_states.dtype, device=hidden_states.device)
+        output.index_copy_(0, indices, hidden_states)
+        return output.view(batch, seqlen, *other_dims)
 
     def _unpad_input(hidden_states, attention_mask):
-        raise NotImplementedError("flash_attn.bert_padding.unpad_input is not available on NPU")
+        """Remove padding from a (batch, seqlen, ...) tensor to get (nnz, ...).
+
+        Pure PyTorch implementation compatible with NPU — no CUDA kernels needed.
+        """
+        import torch as _t
+        seqlens = attention_mask.sum(dim=-1, dtype=_t.int32)
+        max_seqlen = seqlens.max().item()
+        indices = _t.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+        cu_seqlens = _t.zeros(seqlens.shape[0] + 1, dtype=_t.int32, device=seqlens.device)
+        cu_seqlens[1:] = seqlens.cumsum(0)
+        batch, seqlen = hidden_states.shape[:2]
+        other_dims = hidden_states.shape[2:]
+        hidden_states_flat = hidden_states.reshape(batch * seqlen, *other_dims)
+        hidden_states_unpad = hidden_states_flat.index_select(0, indices)
+        return hidden_states_unpad, indices, cu_seqlens, max_seqlen, cu_seqlens
 
     bert_padding.pad_input = _pad_input
     bert_padding.unpad_input = _unpad_input
