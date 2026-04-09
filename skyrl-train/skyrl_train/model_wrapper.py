@@ -17,12 +17,98 @@ from transformers.integrations.deepspeed import HfDeepSpeedConfig
 import numpy as np
 from skyrl_train.distributed.ulysses.utils import ulysses_pad_and_slice_inputs, gather_outputs_and_unpad
 from skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
+from skyrl_train.utils.fused_linear_logprobs import FusedLinearForPPO, _fused_linear_for_ppo_fwd
 try:
     from flash_attn.bert_padding import pad_input, unpad_input
 except ImportError:
     pad_input = None
     unpad_input = None
 from packaging.version import Version
+
+
+def _patch_causal_lm_for_fused_logprobs(model, chunk_size=512):
+    """Monkey-patch a CausalLM model to compute logprobs in chunks instead of
+    materializing the full (B, S, V) logits tensor.
+
+    Adapted from verl's forward_with_torch_backend (dense_common.py).
+    The patch replaces the model class's forward method so that when called with
+    `labels` and `temperature` kwargs, it returns log_probs and entropy computed
+    from hidden_states in chunks, never materializing full logits.
+
+    This must be applied BEFORE FSDP wrapping so that lm_head.weight is
+    accessible inside the FSDP forward context.
+    """
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+    from dataclasses import dataclass
+
+    @dataclass
+    class CausalLMOutputForPPO(CausalLMOutputWithPast):
+        log_probs: Optional[torch.FloatTensor] = None
+        entropy: Optional[torch.FloatTensor] = None
+
+    original_forward = model.__class__.forward
+    fused_ppo = FusedLinearForPPO(chunk_size=chunk_size)
+
+    def _fused_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+        temperature=1.0,
+        **kwargs,
+    ):
+        # If no labels provided, fall back to original forward (e.g. for generate)
+        if labels is None:
+            return original_forward(
+                self, input_ids=input_ids, attention_mask=attention_mask,
+                position_ids=position_ids, past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds, use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict, cache_position=cache_position, **kwargs,
+            )
+
+        # Step 1: Run transformer layers only (self.model is the base model without lm_head)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+        )
+        hidden_states = outputs.last_hidden_state  # (B, S, H)
+
+        # Step 2: Chunked lm_head + logprobs + entropy (inside FSDP context)
+        log_probs, entropy = fused_ppo(
+            hidden_states=hidden_states,
+            vocab_weights=self.lm_head.weight,
+            input_ids=labels,
+            temperature=temperature,
+        )
+
+        return CausalLMOutputForPPO(
+            log_probs=log_probs,
+            entropy=entropy,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    model.__class__.forward = _fused_forward
+    logger.info(f"Patched {model.__class__.__name__}.forward for fused chunked logprobs (chunk_size={chunk_size})")
 
 
 class HFModelWrapper(nn.Module):
@@ -198,6 +284,15 @@ class HFModelWrapper(nn.Module):
             else chunked_entropy_from_logits
         )
 
+        # Chunked lm_head: avoid materializing full (B, S, V) logits.
+        # Adapted from verl's FusedLinearForPPO. Computes logprobs and entropy
+        # from hidden_states in chunks of 512 tokens at a time.
+        self.use_fused_linear_logprobs = kwargs.get("use_fused_linear_logprobs", False)
+        if self.use_fused_linear_logprobs:
+            # Monkey-patch the CausalLM's forward to do chunked lm_head internally.
+            # This way lm_head.weight is accessed inside FSDP's forward context.
+            _patch_causal_lm_for_fused_logprobs(self.model, chunk_size=512)
+
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, **kwargs) -> Union[
         Tuple[torch.LongTensor, torch.LongTensor],
@@ -318,65 +413,91 @@ class HFModelWrapper(nn.Module):
                 sequences_rolled, None, None, self.sequence_parallel_size
             )
 
-        # NOTE (sumanthrh): Once we have position_ids, we don't need attention mask with flash attention.
         if self.use_sample_packing and self.attn_implementation == "flash_attention_2":
             # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
             # Not using attention mask leads to higher perf since flash attention varlen func is enabled
-            output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
+            model_kwargs = dict(attention_mask=None, position_ids=position_ids_fwd)
         else:
-            output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
+            model_kwargs = dict(attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
 
-        logits_BSV = output["logits"]
-        logits_BSV.div_(temperature)
+        if self.use_fused_linear_logprobs:
+            # Fused path: model.forward() has been patched to return log_probs
+            # and entropy instead of logits. lm_head is computed in chunks
+            # inside the FSDP forward context, avoiding full (B,S,V) materialization.
+            output = self.model(
+                sequences_fwd,
+                labels=sequences_rolled,
+                temperature=temperature,
+                return_dict=True,
+                **model_kwargs,
+            )
+            log_probs = output.log_probs
+            entropy_BS = output.entropy
 
-        # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
-        log_probs = logprobs_from_logits(
-            logits_BSV,
-            sequences_rolled,
-            inplace_backward=True,
-        )
+            output_dict = {}
 
-        output = {}
+            # gather output if sp > 1
+            if self.sequence_parallel_size > 1:
+                dim = log_probs.ndim - 1
+                log_probs = gather_outputs_and_unpad(
+                    log_probs, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
+                )
+                if entropy_BS is not None:
+                    entropy_BS = gather_outputs_and_unpad(
+                        entropy_BS, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
+                    )
 
-        # gather output if sp > 1
-        if self.sequence_parallel_size > 1:
-            dim = log_probs.ndim - 1
-            log_probs = gather_outputs_and_unpad(
-                log_probs, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
-            )  # shape can be (1, nnz) - with packing or (B, S) - without packing
+            if self.use_sample_packing:
+                batch_size, seqlen = attention_mask.shape
+                log_probs = pad_input(
+                    log_probs.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                ).squeeze(-1)
+                if entropy_BS is not None:
+                    entropy_BS = pad_input(
+                        entropy_BS.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                    ).squeeze(-1)
 
-        if self.use_sample_packing:
-            # add padding back - postprocess logprobs to be compatible with original tensor
-            batch_size, seqlen = attention_mask.shape
-            # (1, nnz-1) -> (batch_size, seqlen). Pad token ID used by flash attention is 0.
-            log_probs = pad_input(
-                log_probs.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
-            ).squeeze(-1)
+            if compute_entropy and entropy_BS is not None:
+                output_dict["entropy"] = entropy_BS
 
-        if compute_entropy:
-            # For sample packing: entropy is calculated on unpacked data, so no attention mask needed
-            # For non-sample packing: pass the attention mask to exclude padding tokens
-            entropy_mask = None
-            if not self.use_sample_packing:
-                entropy_mask = attention_mask_fwd
+            output = output_dict
+        else:
+            # Original path: full logits materialization
+            output = self.model(sequences_fwd, **model_kwargs)
 
-            entropy_BS = self.chunked_entropy_from_logits_fn(
-                logits_BSV, requires_grad=entropy_requires_grad, attention_mask=entropy_mask
+            logits_BSV = output["logits"]
+            logits_BSV.div_(temperature)
+
+            # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
+            log_probs = logprobs_from_logits(
+                logits_BSV,
+                sequences_rolled,
+                inplace_backward=True,
             )
 
-            if self.sequence_parallel_size > 1:
-                dim = entropy_BS.ndim - 1
-                entropy_BS = gather_outputs_and_unpad(
-                    entropy_BS, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
-                )  # shape can be (1, nnz) - with packing or (B,S) - without packing
-            if self.use_sample_packing:
-                entropy_BS = pad_input(
-                    entropy_BS.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
-                ).squeeze(
-                    -1
-                )  # (1, nnz) -> (B, S)
+            output = {}
 
-            output["entropy"] = entropy_BS
+            if compute_entropy:
+                entropy_mask = None
+                if not self.use_sample_packing:
+                    entropy_mask = attention_mask_fwd
+
+                entropy_BS = self.chunked_entropy_from_logits_fn(
+                    logits_BSV, requires_grad=entropy_requires_grad, attention_mask=entropy_mask
+                )
+
+                if self.sequence_parallel_size > 1:
+                    dim = entropy_BS.ndim - 1
+                    entropy_BS = gather_outputs_and_unpad(
+                        entropy_BS, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
+                    )
+                if self.use_sample_packing:
+                    batch_size, seqlen = attention_mask.shape
+                    entropy_BS = pad_input(
+                        entropy_BS.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                    ).squeeze(-1)
+
+                output["entropy"] = entropy_BS
 
         if isinstance(num_actions, list):
             if len(num_actions) == 1:
