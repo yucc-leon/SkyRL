@@ -756,19 +756,6 @@ class PolicyWorkerBase(Worker):
             )
             # loss function
             # TODO: recompute advantages
-            # DEBUG: log the log_ratio magnitude
-            _log_ratio = action_log_probs - old_action_log_probs
-            if loss_mask is not None:
-                _lr_masked = _log_ratio[loss_mask > 0]
-            else:
-                _lr_masked = _log_ratio.flatten()
-            from loguru import logger as _dbg_logger
-            _dbg_logger.info(
-                f"DEBUG log_ratio: max={_lr_masked.abs().max().item():.6f}, "
-                f"mean={_lr_masked.abs().mean().item():.6f}, "
-                f"action_lp_mean={action_log_probs[loss_mask > 0].mean().item():.6f}, "
-                f"old_lp_mean={old_action_log_probs[loss_mask > 0].mean().item():.6f}"
-            )
             policy_loss, clip_ratio = self.policy_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
