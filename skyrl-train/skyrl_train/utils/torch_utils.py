@@ -238,11 +238,12 @@ def logprobs_from_logits_v2(
         logsumexp_values = torch.stack([torch.logsumexp(logit, dim=-1) for logit in logits])
         logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
-        # For bf16/fp16: use the same logsumexp approach but upcast each row to fp32.
-        # This is equivalent to F.log_softmax(row.float()) but avoids materializing
-        # the full (S, V) fp32 tensor, which OOMs on long sequences.
-        # Verified: max diff vs full fp32 log_softmax < 1e-6.
-        logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1).float()
-        logsumexp_values = torch.stack([torch.logsumexp(row.float(), dim=-1) for row in logits])
+        # For bf16/fp16: use logsumexp approach in native dtype (no fp32 upcast).
+        # This matches H200's flash_attn cross_entropy_loss which also computes in bf16.
+        # fp32 upcast causes policy_loss to be ~1000x larger than H200 because the higher
+        # precision reveals more difference between old_log_probs and log_probs, leading to
+        # larger gradients that destabilize GSPO training.
+        logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        logsumexp_values = torch.stack([torch.logsumexp(row, dim=-1) for row in logits])
         logprobs_labels = logits_labels - logsumexp_values
     return logprobs_labels

@@ -26,7 +26,7 @@ except ImportError:
 from packaging.version import Version
 
 
-def _patch_causal_lm_for_fused_logprobs(model, chunk_size=512):
+def _patch_causal_lm_for_fused_logprobs(model, chunk_size=4096):
     """Monkey-patch a CausalLM model to compute logprobs in chunks instead of
     materializing the full (B, S, V) logits tensor.
 
@@ -291,7 +291,7 @@ class HFModelWrapper(nn.Module):
         if self.use_fused_linear_logprobs:
             # Monkey-patch the CausalLM's forward to do chunked lm_head internally.
             # This way lm_head.weight is accessed inside FSDP's forward context.
-            _patch_causal_lm_for_fused_logprobs(self.model, chunk_size=512)
+            _patch_causal_lm_for_fused_logprobs(self.model, chunk_size=4096)
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, **kwargs) -> Union[
