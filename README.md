@@ -10,6 +10,10 @@
 
 ---
 
+> **Ascend NPU Support (`codescout-npu` branch)**: This branch contains adaptations for running SkyRL on Huawei Ascend 910 NPUs with CANN 8.3. See [`npu_support/README.md`](npu_support/README.md) for details.
+>
+> **昇腾 NPU 支持（`codescout-npu` 分支）**：本分支包含在华为昇腾 910 NPU + CANN 8.3 上运行 SkyRL 的适配。详见 [`npu_support/README.md`](npu_support/README.md)。
+
 # Overview
 
 SkyRL is a full-stack RL library that provides the following components:
