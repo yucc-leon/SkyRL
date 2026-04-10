@@ -276,21 +276,7 @@ class TensorBatch(dict, Generic[DictType]):
         for key, value in shards[0].items():
             if value is not None:
                 if isinstance(value, torch.Tensor):
-                    tensors = [shard[key] for shard in shards]
-                    # Handle tensors with different sizes in non-batch dimensions
-                    # by padding to the max size (can happen with variable-length sequences)
-                    shapes = [t.shape for t in tensors]
-                    if len(set(s[1:] for s in shapes)) > 1:
-                        max_shape = [max(s[d] for s in shapes) for d in range(len(shapes[0]))]
-                        padded = []
-                        for t in tensors:
-                            pad_widths = []
-                            for d in range(len(t.shape) - 1, 0, -1):
-                                pad_widths.extend([0, max_shape[d] - t.shape[d]])
-                            padded.append(torch.nn.functional.pad(t, pad_widths))
-                        cat_data[key] = torch.cat(padded)
-                    else:
-                        cat_data[key] = torch.cat(tensors)
+                    cat_data[key] = torch.cat([shard[key] for shard in shards])
                 else:
                     raise ValueError(f"Unsupported type {type(value)} for key {key}")
             else:
