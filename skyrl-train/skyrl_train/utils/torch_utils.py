@@ -30,77 +30,6 @@ except ImportError:
 CHUNK_SIZE = 1024
 
 
-def chunked_logprobs_from_hidden_states(
-    hidden_states: Float[torch.Tensor, "batch_size seqlen hidden_size"],
-    labels: Integer[torch.Tensor, "batch_size seqlen"],
-    lm_head: torch.nn.Module,
-    temperature: float = 1.0,
-    chunk_size: int = CHUNK_SIZE,
-) -> Float[torch.Tensor, "batch_size seqlen"]:
-    """Compute per-token log-probabilities without materializing the full (B, S, V) logits tensor.
-
-    Processes the sequence in chunks along the S dimension. Each chunk only
-    materializes (B, chunk_size, V) logits via lm_head, computes log_softmax +
-    gather, then discards the logits before the next chunk.
-
-    For Qwen3-4B with V=151643 and S=37000, this reduces peak memory from
-    ~11.2 GB (full logits) to ~0.3 GB (one chunk of 1024 tokens).
-
-    Args:
-        hidden_states: Last hidden states from the transformer, shape (B, S, H).
-        labels: Token IDs to gather log-probs for, shape (B, S).
-        lm_head: The language model head module (nn.Linear mapping H -> V).
-        temperature: Temperature scaling applied before log_softmax.
-        chunk_size: Number of tokens to process at a time.
-
-    Returns:
-        Log-probabilities of the target labels, shape (B, S).
-    """
-    B, S, _ = hidden_states.shape
-    log_probs = torch.empty(B, S, dtype=hidden_states.dtype, device=hidden_states.device)
-
-    for start in range(0, S, chunk_size):
-        end = min(start + chunk_size, S)
-        chunk_logits = lm_head(hidden_states[:, start:end, :])
-        if temperature != 1.0:
-            chunk_logits.div_(temperature)
-        # NOTE: upcast to fp32 for log_softmax precision (matches logprobs_from_logits_v2 behavior)
-        chunk_log_softmax = F.log_softmax(chunk_logits.float(), dim=-1)
-        chunk_labels = labels[:, start:end].unsqueeze(-1)
-        log_probs[:, start:end] = chunk_log_softmax.gather(dim=-1, index=chunk_labels).squeeze(-1)
-        del chunk_logits, chunk_log_softmax
-
-    return log_probs
-
-
-def chunked_entropy_from_hidden_states(
-    hidden_states: Float[torch.Tensor, "batch_size seqlen hidden_size"],
-    lm_head: torch.nn.Module,
-    temperature: float = 1.0,
-    requires_grad: bool = False,
-    attention_mask: Float[torch.Tensor, "batch_size seqlen"] = None,
-    chunk_size: int = CHUNK_SIZE,
-) -> Float[torch.Tensor, "batch_size seqlen"]:
-    """Compute per-token entropy without materializing the full (B, S, V) logits tensor."""
-    B, S, _ = hidden_states.shape
-    cm = nullcontext() if requires_grad else torch.no_grad()
-    with cm:
-        entropy = torch.zeros(B, S, dtype=hidden_states.dtype, device=hidden_states.device)
-        for start in range(0, S, chunk_size):
-            end = min(start + chunk_size, S)
-            chunk_logits = lm_head(hidden_states[:, start:end, :])
-            if temperature != 1.0:
-                chunk_logits.div_(temperature)
-            chunk_logprob = F.log_softmax(chunk_logits, dim=-1)
-            chunk_probs = chunk_logprob.exp()
-            chunk_entropy = -(chunk_probs * chunk_logprob).sum(-1)
-            if attention_mask is not None:
-                chunk_entropy = chunk_entropy * attention_mask[:, start:end]
-            entropy[:, start:end] = chunk_entropy
-            del chunk_logits, chunk_logprob, chunk_probs
-    return entropy
-
-
 def chunked_cross_entropy_from_log_probs(
     logprobs: Float[torch.Tensor, "batch_size seqlen vocab_size"], requires_grad: bool = False
 ) -> Float[torch.Tensor, "batch_size seqlen"]:
@@ -238,12 +167,11 @@ def logprobs_from_logits_v2(
         logsumexp_values = torch.stack([torch.logsumexp(logit, dim=-1) for logit in logits])
         logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
-        # For bf16/fp16: use logsumexp approach in native dtype (no fp32 upcast).
-        # This matches H200's flash_attn cross_entropy_loss which also computes in bf16.
-        # fp32 upcast causes policy_loss to be ~1000x larger than H200 because the higher
-        # precision reveals more difference between old_log_probs and log_probs, leading to
-        # larger gradients that destabilize GSPO training.
-        logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.stack([torch.logsumexp(row, dim=-1) for row in logits])
-        logprobs_labels = logits_labels - logsumexp_values
+        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
+        logprobs_labels = []
+        for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption
+            row_logprobs = F.log_softmax(row_logits, dim=-1)
+            row_logprobs_labels = row_logprobs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+            logprobs_labels.append(row_logprobs_labels)
+        logprobs_labels = torch.stack(logprobs_labels)
     return logprobs_labels
