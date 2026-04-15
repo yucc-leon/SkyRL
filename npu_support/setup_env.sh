@@ -5,7 +5,7 @@
 #   bash npu_support/setup_env.sh [CONDA_BASE]
 #
 # Arguments:
-#   CONDA_BASE  Path to miniforge/miniconda base (default: /sharedata/liyuchen/miniforge3)
+#   CONDA_BASE  Path to miniforge/miniconda base (default: ${CONDA_BASE:-$HOME/miniforge3})
 #
 # This script creates a conda env "codescout-npu" with:
 #   - Python 3.12
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-CONDA_BASE="${1:-/sharedata/liyuchen/miniforge3}"
+CONDA_BASE="${1:-${CONDA_BASE:-$HOME/miniforge3}}"
 ENV_NAME="codescout-npu"
 ENV_PATH="$CONDA_BASE/envs/$ENV_NAME"
 PIP="$ENV_PATH/bin/pip"

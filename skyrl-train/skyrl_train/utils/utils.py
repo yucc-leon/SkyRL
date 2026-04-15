@@ -573,6 +573,14 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         if os.environ.get(proxy_var):
             env_vars[proxy_var] = os.environ[proxy_var]
 
+        # Forward REPO_CACHE for local bare repo clone in rollout workers
+    if os.environ.get("REPO_CACHE"):
+        env_vars["REPO_CACHE"] = os.environ["REPO_CACHE"]
+
+    # Prevent triton namespace conflict in .pth auto-load on NPU
+    if os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") is not None:
+        env_vars["TORCH_DEVICE_BACKEND_AUTOLOAD"] = os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"]
+
     return env_vars
 
 

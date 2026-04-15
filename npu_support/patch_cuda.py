@@ -40,7 +40,9 @@ def _should_patch():
         import torch_npu  # noqa: F401
         import torch
         return hasattr(torch, "npu") and torch.npu.is_available()
-    except ImportError:
+    except (ImportError, RuntimeError):
+        # RuntimeError can happen if torch's triton namespace registration
+        # conflicts during early site-packages loading (npu_autoload.pth)
         return False
 
 
@@ -386,6 +388,18 @@ def _install_flash_attn_stub():
     sys.modules["flash_attn.ops"] = ops_mod
     sys.modules["flash_attn.ops.triton"] = triton_mod
     sys.modules["flash_attn.ops.triton.cross_entropy"] = ce_mod
+
+
+# --- Public API for explicit patching ---
+def ensure_patched():
+    """Ensure the NPU patch is applied.
+
+    Call this explicitly from your entrypoint (e.g. train_npu.py) to guarantee
+    the patch is active, even if the .pth auto-load failed (e.g. due to triton
+    namespace conflicts during early site-packages initialization).
+    """
+    if not _PATCHED and _should_patch():
+        _apply_patch()
 
 
 # --- Auto-apply on import ---
